@@ -8,12 +8,8 @@
 
 - Windows 10/11
 - [GStreamer MSVC x86_64](https://gstreamer.freedesktop.org/download/) runtime + devel
-
-## 依赖
-
-1. Python 3.8+
-2. 安装时自动设置环境变量 `GSTREAMER_1_0_ROOT_MSVC_X86_64`
-3. `pip install pygobject pycairo`
+- 安装时自动设置环境变量 `GSTREAMER_1_0_ROOT_MSVC_X86_64`
+- `pip install pygobject pycairo`
 
 ## 快速开始
 
