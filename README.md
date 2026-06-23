@@ -36,9 +36,9 @@ gst.destroy_pipe()
 
 | 模式 | 说明 | 测试状态 |
 |---|---|---|
-| `udp` | RTP over UDP，无连接低延迟 | 未测试 |
-| `tcp` | RTP over TCP，可靠传输 | 未测试 |
-| `srt` | SRT 协议，低延迟可靠，适合公网 | 未测试 |
+| `udp` | RTP over UDP，无连接低延迟 | AI写的，我没试 |
+| `tcp` | RTP over TCP，可靠传输 | 同上 |
+| `srt` | SRT 协议，低延迟可靠，适合公网 | 同上 |
 | `rtsp` | 推流到 RTSP 服务器（自动选 payloader） | 已测试 |
 
 ## SEI 格式
