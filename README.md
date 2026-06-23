@@ -1,4 +1,4 @@
-# gst-sei-push
+# GStreamer-SEI
 
 基于 GStreamer 的通用视频推流工具，支持在 H.264/H.265 码流中注入自定义 SEI NAL 单元携带时间戳或自定义元数据。
 
