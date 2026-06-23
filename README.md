@@ -1,6 +1,6 @@
 # GStreamer-SEI
 
-基于 GStreamer 的通用视频推流工具，支持在 H.264/H.265 码流中注入自定义 SEI NAL 单元携带时间戳或自定义元数据。
+使用GStreamer，在 H.264/H.265 码流中注入自定义 SEI NAL 单元，可用于传递CARLA仿真的时间戳。
 
 ## 功能
 
@@ -13,8 +13,9 @@
 ## 依赖 (Windows)
 
 1. [GStreamer MSVC x86_64](https://gstreamer.freedesktop.org/download/) runtime + devel
-2. `pip install pygobject pycairo`
-3. 设置环境变量 `GSTREAMER_1_0_ROOT_MSVC_X86_64`
+2. 安装时自动设置环境变量 `GSTREAMER_1_0_ROOT_MSVC_X86_64`
+3. `pip install pygobject pycairo`
+
 
 ## 快速开始
 
