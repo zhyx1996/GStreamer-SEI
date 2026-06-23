@@ -1,6 +1,6 @@
 # GStreamer-SEI
 
-基于 GStreamer 的视频推流工具（Windows），在 H.264/H.265 码流中注入自定义 SEI NAL 单元，可用于传递CARLA仿真的时间戳。
+基于 GStreamer 的视频推流工具，在 H.264/H.265 码流中注入自定义 SEI NAL 单元，可用于传递CARLA仿真的时间戳。
 
 因为没找到合适的教程，就从头写了……
 
