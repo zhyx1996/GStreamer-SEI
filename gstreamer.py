@@ -31,7 +31,7 @@ import collections # deque (SEI 时间戳 FIFO)
 import numpy as np # 仅 timestamp overlay 场景用, 不影响模块加载
 
 # ── GStreamer 原生 DLL 路径 ──────────────────────────────────────────────────
-# 注: 使用pip install gstreamer-bundle安装的话不需要这部分
+# 注: 使用pip install gstreamer-bundle安装的话，则不需要这部分
 # 问题: Python ≥ 3.8 引入 SetDefaultDllDirectories, PATH 不再用于 LoadLibrary。
 #       导致 import gi 时 _gi.pyd 找不到 glib-2.0-0.dll / gobject-2.0-0.dll。
 # 解决: import gi 之前调用 os.add_dll_directory() 显式注册 DLL 所在目录。
