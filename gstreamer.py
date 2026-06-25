@@ -10,8 +10,11 @@
 #  timestamp   double  仿真时间 (秒)
 #  frame       int     帧序号
 # ==============================================================================
-#  依赖 (Windows)
+#  依赖
 #  ──────────────────────────────────────────────────────────────────────────
+#  只在python中使用的话，可以直接pip install gstreamer-bundle
+#  
+#  或使用官方安装程序 (Windows)：
 #  1. 下载 GStreamer MSVC x86_64 runtime + devel (选 Complete 安装)
 #     https://gstreamer.freedesktop.org/download/
 #  2. pip install pygobject pycairo
@@ -28,6 +31,7 @@ import collections # deque (SEI 时间戳 FIFO)
 import numpy as np # 仅 timestamp overlay 场景用, 不影响模块加载
 
 # ── GStreamer 原生 DLL 路径 ──────────────────────────────────────────────────
+# 注: 使用pip install gstreamer-bundle安装的话不需要这部分
 # 问题: Python ≥ 3.8 引入 SetDefaultDllDirectories, PATH 不再用于 LoadLibrary。
 #       导致 import gi 时 _gi.pyd 找不到 glib-2.0-0.dll / gobject-2.0-0.dll。
 # 解决: import gi 之前调用 os.add_dll_directory() 显式注册 DLL 所在目录。
