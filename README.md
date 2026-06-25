@@ -5,6 +5,9 @@
 因为没找到合适的教程，就从头写了……
 
 ## 环境
+- pip install gstreamer-bundle
+
+或
 
 - Windows 10/11
 - [GStreamer MSVC x86_64](https://gstreamer.freedesktop.org/download/) runtime + devel
