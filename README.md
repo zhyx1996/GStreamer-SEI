@@ -5,12 +5,12 @@
 因为没找到合适的教程，就从头写了……
 
 ## 环境
+
 - pip install gstreamer-bundle
 
-或
+或使用官方安装程序 (Windows)：
 
-- Windows 10/11
-- [GStreamer MSVC x86_64](https://gstreamer.freedesktop.org/download/) runtime + devel
+- [GStreamer MSVC x86_64](https://gstreamer.freedesktop.org/download/) 安装runtime + devel
 - 安装时自动设置环境变量 `GSTREAMER_1_0_ROOT_MSVC_X86_64`
 - `pip install pygobject pycairo`
 
