@@ -10,10 +10,10 @@
 #  timestamp   double  仿真时间 (秒)
 #  frame       int     帧序号
 # ==============================================================================
-#  依赖
+#  依赖 (Windows)
 #  ──────────────────────────────────────────────────────────────────────────
-#  只在python中使用的话，可以直接pip install gstreamer-bundle
-#  
+#  只在python中使用的话，可以直接pip install gstreamer-bundle (python >= 3.9)
+#
 #  或使用官方安装程序 (Windows)：
 #  1. 下载 GStreamer MSVC x86_64 runtime + devel (选 Complete 安装)
 #     https://gstreamer.freedesktop.org/download/
@@ -30,21 +30,24 @@ import threading   # GLib.MainLoop 运行在 daemon 线程
 import collections # deque (SEI 时间戳 FIFO)
 import numpy as np # 仅 timestamp overlay 场景用, 不影响模块加载
 
-# ── GStreamer 原生 DLL 路径 ──────────────────────────────────────────────────
-# 注: 使用pip install gstreamer-bundle安装的话，则不需要这部分
-# 问题: Python ≥ 3.8 引入 SetDefaultDllDirectories, PATH 不再用于 LoadLibrary。
-#       导致 import gi 时 _gi.pyd 找不到 glib-2.0-0.dll / gobject-2.0-0.dll。
-# 解决: import gi 之前调用 os.add_dll_directory() 显式注册 DLL 所在目录。
-_gst_bin = os.path.join(
-    os.environ.get("GSTREAMER_1_0_ROOT_MSVC_X86_64",             # 环境变量(MSVC 安装包自动设)
-                     r"C:\gstreamer\1.0\msvc_x86_64"),               # default
-    "bin"   # 拼接 \bin (DLL 所在目录)
-)
-try:
-    os.add_dll_directory(_gst_bin)   # Python ≥ 3.8: 注册到 DLL 搜索列表
-except AttributeError:               # Python < 3.8: 无此方法, 退而改 PATH
-    os.environ["PATH"] = _gst_bin + os.pathsep + os.environ.get("PATH", "")
-# 此时 _gi.pyd 所需原生库已可被 Windows 加载
+# 为pyinstaller打包设置环境(仅适用于pip install gstreamer-bundle安装)
+# 不打包则可以跳过
+import gstreamer_libs
+gstreamer_libs.setup_python_environment()
+
+# # 若使用官方安装程序，则在 Python 3.8+ 中，需要显式添加 DLL 搜索路径，否则找不到 gstreamer-1.0.dll
+# # pip install gstreamer-bundle 安装 或 python < 3.8 则可以跳过
+# if sys.version_info >= (3, 8):
+#     gstreamer_root = os.environ.get("GSTREAMER_1_0_ROOT_MSVC_X86_64")
+#     if gstreamer_root:
+#         dll_path = os.path.join(gstreamer_root, "bin")
+#         if os.path.isdir(dll_path):
+#             os.add_dll_directory(dll_path)
+#             print(f"[DEBUG] gstreamer.py: Added DLL search path: {dll_path}")
+#         else:
+#             print(f"[WARN] gstreamer.py: DLL path does not exist: {dll_path}")
+#     else:
+#         print("[WARN] gstreamer.py: GSTREAMER_1_0_ROOT_MSVC_X86_64 not set, may fail to load GStreamer DLLs")
 
 import gi
 gi.require_version("Gst", "1.0")     # GStreamer 1.x GI 绑定
@@ -53,7 +56,15 @@ from gi.repository import Gst, GstApp, GLib
 
 # Gst.init 初始化 GStreamer 内部状态: 类型注册 / 插件扫描 / registry 缓存。
 # 必须传 sys.argv (新版 pygobject Gst.init(None) 会 TypeError)。
-Gst.init(sys.argv)
+print("[DEBUG] gstreamer.py: 开始 Gst.init...", flush=True)
+try:
+    Gst.init(sys.argv)
+    print("[DEBUG] gstreamer.py: Gst.init OK, 模块加载完成", flush=True)
+except Exception as e:
+    print(f"[DEBUG] gstreamer.py: Gst.init EXCEPTION: {e}", flush=True)
+    traceback.print_exc()
+    print("[DEBUG] gstreamer.py: re-raising...", flush=True)
+    raise
 
 
 # ==============================================================================
@@ -77,7 +88,7 @@ class GStreamerConfig:
         #   "nvh264enc" = NVIDIA NVENC 硬件 H.264
         #   "nvh265enc" = NVIDIA NVENC 硬件 H.265
         #   "vah264enc" = VAAPI 硬件 H.264 (Intel/AMD 核显)
-        self.vcodec: str = "nvh265enc"
+        self.vcodec: str = "auto"                  # "auto" → 自动检测 NVIDIA GPU, 无则回退 x265enc
         self.video_bitrate: str = "4000k"        # 目标码率: "4000k" (kbps) 或 "4M" (Mbps)
         self.encoder_preset: str = "ultrafast"   # ultrafast > veryfast > medium > slow
         self.encoder_tune: str = "zerolatency"   # zerolatency = 关 B 帧, 最低延迟
@@ -89,10 +100,10 @@ class GStreamerConfig:
         #   "srt"  = SRT 协议 (低延迟+可靠传输, 适合公网)
         #   "rtsp" = 推流到 MediaMTX 等 RTSP 中继服务器
         self.output_mode: str = "rtsp"            # rtsp: 直接推流到 RTSP 服务器
-        self.output_host: str = "127.0.0.1"         # RTSP 服务器 IP
+        self.output_host: str = "127.0.0.1"       # RTSP 服务器 IP
         self.output_port: int = 8554              # RTSP 服务器端口
-        self.output_url: str = "rtsp://127.0.0.1:8554/stream"  # RTSP 推流地址
-        self.rtsp_mount: str = "/stream"                       # 挂载点路径
+        self.output_url: str = "rtsp://127.0.0.1:8554/stream/cam_front_left"  # RTSP 推流地址
+        self.rtsp_mount: str = "/stream/cam_front_left"    # 挂载点路径
 
         # ── 杂项 ──
         self.label: str = "gst-carla"            # 日志标签, 区分多实例
@@ -133,7 +144,7 @@ class GStreamerObject:
     @staticmethod
     def _is_h265(vcodec: str) -> bool:
         """判定编码器名称是否属于 H.265 / HEVC 系列。"""
-        return "265" in vcodec or "hevc" in vcodec.lower() or "h265" in vcodec.lower()
+        return "265" in vcodec or "hevc" in vcodec.lower()
 
     @staticmethod
     def _parse_bitrate(bitrate_str: str) -> float:
@@ -146,7 +157,18 @@ class GStreamerObject:
         if s.endswith("m"):   return float(s[:-1]) * 1000   # M → k
         return float(s)                                     # 假定 kbps
 
-    def _build_encoder_segment(self) -> str:
+    @staticmethod
+    def _detect_best_encoder() -> str:
+        """自动检测最佳编码器: GStreamer 注册表有 nvenc → nvh265enc, 无 → x265enc"""
+        # 直接查 GStreamer 注册表，避免 subprocess 调用 nvidia-smi (打包后可能卡死)
+        registry = Gst.Registry.get()
+        if registry.check_feature_version("nvh265enc", 0, 0, 0):
+            print("[gstreamer] 检测到 nvh265enc 插件, 使用硬件编码")
+            return "nvh265enc"
+        print("[gstreamer] 未检测到 nvh265enc, 回退到软件编码 x265enc")
+        return "x265enc"
+
+    def _build_encoder_segment(self, vcodec: str) -> str:
         """
         构建编码器 element 参数字符串。
 
@@ -154,8 +176,10 @@ class GStreamerObject:
 			软件 x264/x265: tune / speed-preset / bitrate / key-int-max
 			NVENC:           preset / rc-mode / bitrate / gop-size
 			VAAPI:           rate-control / bitrate / key-int-max
+
+        Args:
+            vcodec: 已解析的编码器名称 (由 _detect_best_encoder() 或配置直接指定)
         """
-        vcodec = self._gst_cfg.vcodec
         br = int(self._parse_bitrate(self._gst_cfg.video_bitrate))  # kbps
         gop = self._gst_cfg.input_fps  # GOP（两个 I 帧之间的帧数） = 帧率, 即每秒一个 I 帧
 
@@ -198,6 +222,8 @@ class GStreamerObject:
         w, h, fps = self._gst_cfg.input_width, self._gst_cfg.input_height, self._gst_cfg.input_fps
         pix = self._gst_cfg.input_pix_fmt
         vcodec = self._gst_cfg.vcodec
+        if vcodec == "auto":
+            vcodec = self._detect_best_encoder()
 
         # 根据编码器类型选择对应参数 (H.265 vs H.264)
         is_h265 = self._is_h265(vcodec)
@@ -208,13 +234,16 @@ class GStreamerObject:
         # NVENC 硬件编码器需要 NV12 格式, 软件编码器用 I420
         enc_fmt = "NV12" if "nv" in vcodec.lower() else "I420"
 
+        # 构建编码器段 (复用已解析的 vcodec)
+        encoder_seg = self._build_encoder_segment(vcodec)
+
         # RTSP 模式不需要 RTP payloader (rtspclientsink 自动处理)
         if self._gst_cfg.output_mode == "rtsp":
             return (
                 f"appsrc name=mysrc is-live=true block=true format=time "
                 f"caps=video/x-raw,format={pix},width={w},height={h},framerate={fps}/1 ! "
                 f"videoconvert ! video/x-raw,format={enc_fmt} ! "
-                f"{self._build_encoder_segment()} ! "
+                f"{encoder_seg} ! "
                 f"{parser} ! {stream_caps} ! "
                 f"{self._build_output_segment()}"
             )
@@ -223,7 +252,7 @@ class GStreamerObject:
                 f"appsrc name=mysrc is-live=true block=true format=time "
                 f"caps=video/x-raw,format={pix},width={w},height={h},framerate={fps}/1 ! "
                 f"videoconvert ! video/x-raw,format={enc_fmt} ! "
-                f"{self._build_encoder_segment()} ! "
+                f"{encoder_seg} ! "
                 f"{parser} ! "
                 f"{payloader} ! "
                 f"{self._build_output_segment()}"

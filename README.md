@@ -6,7 +6,13 @@
 
 ## 环境
 
-- pip install gstreamer-bundle
+推荐直接使用 pip 版本的 GStreamer bundle：
+
+```bash
+pip install gstreamer-bundle opencv-python numpy
+```
+
+如果需要运行 `demo.py --carla`，还需要安装对应版本的 CARLA Python 包。
 
 或使用官方安装程序 (Windows)：
 
@@ -17,12 +23,12 @@
 ## 快速开始
 
 ```python
-from gstreamer import GStreamerConfig, GStreamerObject
+from gst_streaming import GStreamerConfig, GStreamerObject
 
 cfg = GStreamerConfig()
-cfg.vcodec = "nvh265enc"
+cfg.vcodec = "auto"  # 自动检测 nvh265enc，否则回退 x265enc
 cfg.output_mode = "rtsp"
-cfg.output_url = "rtsp://127.0.0.1:8554/stream"
+cfg.output_url = "rtsp://127.0.0.1:8554/stream/cam_front_left"
 
 gst = GStreamerObject(cfg)
 gst.initialize_pipe()
@@ -34,6 +40,67 @@ gst.destroy_pipe()
 ```
 
 完整示例见 `demo.py`。
+
+## 运行 demo
+
+`demo.py` 支持两种模式：
+
+```bash
+python demo.py --video
+python demo.py --carla
+```
+
+默认 `--video` 模式会读取：
+
+```text
+D:\Navigation\Code\gst\test.mp4
+```
+
+并推流到：
+
+```text
+rtsp://127.0.0.1:8554/stream/cam_front_left
+```
+
+运行前需要先启动 RTSP 中继服务，例如 [MediaMTX](https://github.com/bluenviron/mediamtx)。拉流测试命令：
+
+```bash
+ffplay -fflags nobuffer -flags low_delay -framedrop rtsp://127.0.0.1:8554/stream/cam_front_left
+```
+
+或：
+
+```bash
+gst-launch-1.0 rtspsrc location=rtsp://127.0.0.1:8554/stream/cam_front_left latency=0 drop-on-latency=true buffer-mode=3 ! rtph265depay ! h265parse ! nvh265dec ! d3d11videosink sync=false
+```
+
+## PyInstaller 打包
+
+仓库提供了 `demo.spec`，用于将 `demo.py` 打包为单文件 exe：
+
+```bash
+pyinstaller --noconfirm demo.spec
+```
+
+`gst_streaming.py` 会在 `import gi` 前执行：
+
+```python
+import gstreamer_libs
+gstreamer_libs.setup_python_environment()
+```
+
+这用于恢复 `pip install gstreamer-bundle` 在冻结程序中的运行时环境。`demo.spec` 同时会收集以下 GStreamer wheel 包：
+
+- `gstreamer_libs`
+- `gstreamer_plugins`
+- `gstreamer_plugins_libs`
+- `gstreamer_plugins_restricted`
+- `gstreamer_plugins_gpl`
+- `gstreamer_plugins_gpl_restricted`
+- `gstreamer_python`
+- `gstreamer_ext_runtime`
+
+在没有 NVIDIA GPU 的机器上，GStreamer 插件扫描或硬件编码器探测可能产生 D3D11 / MediaFoundation 相关 warning。若需要无 GPU 机器稳定运行，建议在 spec 中进一步裁剪不需要的硬件相关插件，或将 `vcodec` 固定为软件编码器 `x265enc`。
 
 ## 推流模式
 

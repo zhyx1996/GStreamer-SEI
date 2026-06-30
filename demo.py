@@ -8,8 +8,8 @@
 # ==============================================================================
 
 # 拉流指令：
-# ffplay -fflags nobuffer -flags low_delay -framedrop rtsp://127.0.0.1:8554/stream
-# gst-launch-1.0 rtspsrc location=rtsp://127.0.0.1:8554/stream latency=0 drop-on-latency=true buffer-mode=3 ! rtph265depay ! h265parse ! nvh265dec ! d3d11videosink sync=false
+# ffplay -fflags nobuffer -flags low_delay -framedrop rtsp://127.0.0.1:8554/stream/cam_front_left
+# gst-launch-1.0 rtspsrc location=rtsp://127.0.0.1:8554/stream/cam_front_left latency=0 drop-on-latency=true buffer-mode=3 ! rtph265depay ! h265parse ! nvh265dec ! d3d11videosink sync=false
 
 import argparse
 import queue
@@ -17,19 +17,19 @@ import time
 import sys
 import os
 
-# 把 test 目录加入 sys.path 以导入 gstreamer 模块
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "test"))
-from gstreamer import GStreamerConfig, GStreamerObject
+print("[DEBUG] demo.py: 开始 import gst_streaming...", flush=True)
+from gst_streaming import GStreamerConfig, GStreamerObject
+print("[DEBUG] demo.py: import gst_streaming OK", flush=True)
 
 
 # ==================== 配置 ====================
 CARLA_HOST = "127.0.0.1"
-CARLA_PORT = 2000
+CARLA_PORT = 3000
 CAMERA_WIDTH = 1920
 CAMERA_HEIGHT = 1080
 CAMERA_FPS = 10
-RTSP_URL = "rtsp://127.0.0.1:8554/stream"
-VIDEO_PATH = "input.mp4"
+RTSP_URL = "rtsp://127.0.0.1:8554/stream/cam_front_left"
+VIDEO_PATH = r"D:\Navigation\Code\gst\test.mp4"
 # =============================================
 
 
@@ -40,7 +40,7 @@ def make_gst_config():
     cfg.input_height = CAMERA_HEIGHT
     cfg.input_fps = CAMERA_FPS
     cfg.input_pix_fmt = "BGRA"
-    cfg.vcodec = "nvh265enc"
+    cfg.vcodec = "auto"     # 自动检测: NVIDIA GPU → nvh265enc, 否则 → x265enc
     cfg.video_bitrate = "4000k"
     cfg.output_mode = "rtsp"
     cfg.output_url = RTSP_URL
