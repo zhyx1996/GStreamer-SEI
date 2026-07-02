@@ -62,7 +62,7 @@ D:\Navigation\Code\gst\test.mp4
 默认会启动内置 RTSP Server，监听：
 
 ```text
-rtsp://127.0.0.1:8554/stream/cam_front_left
+rtsp://0.0.0.0:8554/stream/cam_front_left
 ```
 
 拉流测试命令：
@@ -124,22 +124,6 @@ gstreamer_libs.setup_python_environment()
 | `rtsp` | 使用 `rtspclientsink` 推流到 MediaMTX 等 RTSP 服务器 | 已测试 |
 | `rtsp_server` | 本进程启动 `gst-rtsp-server`，客户端直接拉流 | 已测试 |
 
-`rtsp_server` 模式中 payloader 必须命名为 `pay0`，这是 `gst-rtsp-server` 的约定，用于把该 payloader 映射为第 0 路 RTSP media track。
-
-编码流 caps 统一显式指定为：
-
-```text
-video/x-h265,stream-format=byte-stream,alignment=au
-```
-
-或 H.264：
-
-```text
-video/x-h264,stream-format=byte-stream,alignment=au
-```
-
-`alignment=au` 表示 parser 输出按 access unit（完整访问单元/帧语义）对齐，比默认协商更稳定，尤其适合在 parser 后插入 SEI 再交给 RTP payloader。
-
 ## SEI 格式
 
 ```
@@ -162,7 +146,7 @@ giolibproxy.dll: 找不到指定的模块
 Failed to load module ... giolibproxy.dll
 ```
 
-这通常是 GIO proxy 模块的依赖警告，对本机 RTSP 拉流一般无影响。若使用 `d3d11videosink` / `nvh265dec`，还会打印 D3D11、CUDA context 信息，也属于客户端显示/解码侧日志。
+这通常是 GIO proxy 模块的依赖警告，对本机 RTSP 拉流一般无影响。
 
 ## 解码端 (C++)
 
