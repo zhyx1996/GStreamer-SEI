@@ -115,6 +115,157 @@ class GStreamerConfig:
 #  GStreamerObject — 核心推流类
 # ==============================================================================
 
+class SharedRtspServer:
+    """
+    共享 RTSP Server 管理器。
+
+    核心设计: 同一 (host, port) 对全局只创建一个 GstRtsPServer 实例，
+    多路视频流通过不同的 mount 挂载点（如 /stream/cam_front_left）复用在同一个 server 上。
+    所有实例共享一个后台 GLib MainLoop 线程。
+
+    典型场景: 推流端创建多个 GStreamerObject，每个对应一路相机，
+    它们都调用 add_factory 注册不同的 mount，底层共享同一个 server 和事件循环。
+    """
+
+    # 类级别的锁，保护 _servers 字典的并发读写
+    # （多个 GStreamerObject 实例可能在不同线程中同时调用 add_factory / remove_factory）
+    _lock = threading.Lock()
+
+    # 全局 RTSP server 注册表: {(host, port): {"server": ..., "source_id": ..., "mounts": set()}}
+    # key = (IP 地址, 端口号) 二元组，唯一标识一个 RTSPServer
+    _servers = {}
+
+    # 全局共享的 GLib 主循环和后台线程（所有 server 共用）
+    _main_loop: GLib.MainLoop = None      # GLib 事件循环，驱动 GStreamer 异步信号（如 RTSP 客户端连接）
+    _loop_thread: threading.Thread = None # 运行 main_loop.run() 的守护线程
+
+    @classmethod
+    def _ensure_main_loop(cls):
+        """
+        确保全局 GLib 主循环在后台运行。
+
+        如果已有活跃的循环/线程则直接返回，否则新创建一个 GLib.MainLoop
+        并启动 daemon 线程运行它。该循环负责处理所有 RTSPServer 的异步事件
+        （如客户端连接、请求处理等）。
+        """
+        if cls._main_loop and cls._loop_thread and cls._loop_thread.is_alive():
+            return  # 已有活跃循环，无需重复创建
+        cls._main_loop = GLib.MainLoop.new(None, False)  # False = 非正在运行，需手动 run
+        cls._loop_thread = threading.Thread(
+            target=cls._main_loop.run,
+            name="gst-rtsp-server-loop",
+            daemon=True,  # 守护线程: 主线程退出时自动结束，无需显式 join
+        )
+        cls._loop_thread.start()
+
+    @classmethod
+    def add_factory(cls, host: str, port: int, mount: str, factory: GstRtspServer.RTSPMediaFactory):
+        """
+        注册一路 RTSP 媒体流到共享 server。
+
+        如果 (host, port) 对应的 server 还不存在，则新建一个 RTSPServer 并 attach 到 GLib 主循环。
+        然后在 server 的 mount points 上添加指定的 factory，使得客户端可以通过
+        rtsp://host:port/mount 拉取该路流。
+
+        Args:
+            host:   监听地址（"0.0.0.0" 监听所有网卡）
+            port:   RTSP 端口
+            mount:  挂载点路径（如 "/stream/cam_front_left"）
+            factory: RTSPMediaFactory 实例，定义了该路流的 GStreamer pipeline
+
+        Returns:
+            (server_key, mount_path) 二元组，用于后续 remove_factory 时注销
+
+        Raises:
+            RuntimeError: 同一 mount 重复注册，或 server.attach() 失败
+        """
+        # 确保 mount 以 "/" 开头，统一格式
+        mount = mount if mount.startswith("/") else f"/{mount}"
+        # 用 (host, port) 作为唯一键，host=None 时等效于 "0.0.0.0"
+        key = (host or "0.0.0.0", int(port))
+
+        with cls._lock:                     # 加锁保证线程安全
+            cls._ensure_main_loop()         # 确保 GLib 主循环已启动
+
+            entry = cls._servers.get(key)
+            if entry is None:
+                # --- 首次使用该 (host, port): 创建新的 RTSPServer ---
+                server = GstRtspServer.RTSPServer.new()
+                server.set_service(str(port))   # 设置端口
+                if host:
+                    server.set_address(host)    # 设置监听地址（默认 0.0.0.0）
+                # attach 到 GLib 默认主上下文，返回该 server 的 source ID（用于后续销毁）
+                source_id = server.attach(None)
+                if source_id == 0:
+                    raise RuntimeError(f"Failed to attach RTSP server on {key[0]}:{key[1]}")
+                entry = {
+                    "server": server,
+                    "source_id": source_id,
+                    "mounts": set(),  # 已注册的 mount 路径集合，用于防重和空载清理
+                }
+                cls._servers[key] = entry
+
+            # --- 检查 mount 是否已存在（防止重复注册） ---
+            if mount in entry["mounts"]:
+                raise RuntimeError(f"RTSP mount already exists: rtsp://{key[0]}:{key[1]}{mount}")
+
+            # --- 将 factory 注册到 server 的 mount points ---
+            mounts = entry["server"].get_mount_points()
+            mounts.add_factory(mount, factory)
+            entry["mounts"].add(mount)
+
+            return key, mount
+
+    @classmethod
+    def remove_factory(cls, key, mount: str):
+        """
+        注销一路 RTSP 媒体流。
+
+        从 server 的 mount points 中移除对应的 factory。
+        如果该 server 上已没有其他活跃的 mount，则销毁整个 server 并释放资源。
+        如果所有 server 都已清空，则退出全局 GLib 主循环。
+
+        Args:
+            key:   add_factory 返回的 server_key，标识 (host, port)
+            mount: 要注销的挂载点路径
+        """
+        if key is None or not mount:
+            return  # 无效参数，静默返回
+
+        with cls._lock:
+            entry = cls._servers.get(key)
+            if entry is None:
+                return  # server 已经不存在，无需操作
+
+            # 尝试从 mount points 中移除 factory（忽略异常，可能已被外部清理）
+            try:
+                mounts = entry["server"].get_mount_points()
+                mounts.remove_factory(mount)
+            except Exception:
+                pass
+            entry["mounts"].discard(mount)
+
+            if entry["mounts"]:
+                return  # 该 server 上还有其他活跃 mount，保留 server
+
+            # --- 该 server 已无活跃 mount，销毁它 ---
+            if entry["source_id"]:
+                try:
+                    GLib.source_remove(entry["source_id"])  # 从 GLib 主循环移除
+                except Exception:
+                    pass
+            cls._servers.pop(key, None)
+
+            # --- 如果所有 server 都已清空，退出全局 GLib 主循环 ---
+            if not cls._servers and cls._main_loop:
+                try:
+                    cls._main_loop.quit()
+                except Exception:
+                    pass
+                cls._main_loop = None
+                cls._loop_thread = None
+
+
 class GStreamerObject:
     """
     GStreamer 视频推流对象
@@ -136,9 +287,9 @@ class GStreamerObject:
         self._main_loop: GLib.MainLoop = None    # GLib 事件循环, 处理信号/回调
         self._loop_thread: threading.Thread = None  # 后台线程, 运行 main_loop.run()
         self._ready: bool = False                # pipeline 是否就绪 (可 push 帧)
-        self._rtsp_server: GstRtspServer.RTSPServer = None
         self._rtsp_factory: GstRtspServer.RTSPMediaFactory = None
-        self._rtsp_source_id: int = 0
+        self._rtsp_server_key = None
+        self._rtsp_mount_path: str = ""
         self._actual_vcodec: str = gst_cfg.vcodec # auto 解析后的实际编码器, 供 SEI NAL 类型判断
         self._sei_ts_queue: collections.deque = collections.deque(maxlen=5)  # FIFO, zerolatency保证1:1
         self._sei_lock = threading.Lock()         # 保护 _sei_ts_queue 的跨线程读写
@@ -362,30 +513,23 @@ class GStreamerObject:
             print(f"[{self._gst_cfg.label}] SEI probe attached to parser src pad")
 
     def _initialize_rtsp_server(self) -> bool:
-        """启动内置 gst-rtsp-server，客户端连接后通过 appsrc 推实时帧。"""
+        """注册一路 RTSP mount 到共享 gst-rtsp-server，客户端连接后通过 appsrc 推实时帧。"""
         try:
             launch = self._build_rtsp_server_launch()
             mount = self._gst_cfg.rtsp_mount if self._gst_cfg.rtsp_mount.startswith("/") else f"/{self._gst_cfg.rtsp_mount}"
-            print(f"[{self._gst_cfg.label}] RTSP server launch:\n  {launch}")
-
-            self._ensure_main_loop()
-
-            self._rtsp_server = GstRtspServer.RTSPServer.new()
-            self._rtsp_server.set_service(str(self._gst_cfg.output_port))
-            if self._gst_cfg.output_host:
-                self._rtsp_server.set_address(self._gst_cfg.output_host)
+            print(f"[{self._gst_cfg.label}] RTSP server mount {mount} launch:\n  {launch}")
 
             self._rtsp_factory = GstRtspServer.RTSPMediaFactory.new()
             self._rtsp_factory.set_launch(launch)
             self._rtsp_factory.set_shared(True)
             self._rtsp_factory.connect("media-configure", self._on_rtsp_media_configure)
 
-            mounts = self._rtsp_server.get_mount_points()
-            mounts.add_factory(mount, self._rtsp_factory)
-
-            self._rtsp_source_id = self._rtsp_server.attach(None)
-            if self._rtsp_source_id == 0:
-                raise RuntimeError("Failed to attach RTSP server")
+            self._rtsp_server_key, self._rtsp_mount_path = SharedRtspServer.add_factory(
+                self._gst_cfg.output_host,
+                self._gst_cfg.output_port,
+                mount,
+                self._rtsp_factory,
+            )
 
             self._ready = True
             print(f"[{self._gst_cfg.label}] RTSP server ready: rtsp://{self._gst_cfg.output_host}:{self._gst_cfg.output_port}{mount}")
@@ -440,10 +584,10 @@ class GStreamerObject:
         """
         发送 Carla 传感器图像。
 
-        直接取 carla_image.raw_data (BGRA bytes), 不经 numpy 编解码。
+        直接取 carla_image.raw_data (BGRA memoryview), 显式转 bytes 后推入 GStreamer。
 
         carla_image 属性:
-			raw_data   (bytes)   BGRA 像素
+			raw_data   (memoryview) BGRA 像素
 			width      (int)     须 = input_width
 			height     (int)     须 = input_height
 			timestamp  (double)  仿真时间戳 (秒, 用于 SEI 注入)
@@ -452,12 +596,15 @@ class GStreamerObject:
         if not self._ready or self._appsrc is None:
             return
         try:
-            buf = Gst.Buffer.new_wrapped(carla_image.raw_data)
+            raw_data = carla_image.raw_data
+            frame_data = raw_data.tobytes() if isinstance(raw_data, memoryview) else bytes(raw_data)
+            buf = Gst.Buffer.new_wrapped(frame_data)
+
             # FIFO 入队时间戳 (微秒), probe 按帧顺序出队
             ts_us = int(carla_image.timestamp * 1_000_000)
             with self._sei_lock:
                 self._sei_ts_queue.append(ts_us)
-            print(f"[{self._gst_cfg.label}] Carla ts={carla_image.timestamp:.6f}s  frame={carla_image.frame}  SEI_us={ts_us}")
+
             ret = self._appsrc.emit("push-buffer", buf)
             if ret != Gst.FlowReturn.OK:
                 print(f"[WARN] {self._gst_cfg.label} push-buffer: {ret}")
@@ -593,14 +740,11 @@ class GStreamerObject:
     def _cleanup_internal(self):
         """内部清理, 安全可重入。"""
         self._ready = False
-        if self._rtsp_source_id:
-            try:
-                GLib.source_remove(self._rtsp_source_id)
-            except Exception:
-                pass
-            self._rtsp_source_id = 0
+        if self._rtsp_factory is not None:
+            SharedRtspServer.remove_factory(self._rtsp_server_key, self._rtsp_mount_path)
+            self._rtsp_server_key = None
+            self._rtsp_mount_path = ""
         self._rtsp_factory = None
-        self._rtsp_server = None
         # pipeline → NULL: 释放编码器上下文、网络连接等
         # 用线程 + 超时防止阻塞 (rtspclientsink 网络超时可能很久)
         if self._pipeline:
@@ -632,7 +776,7 @@ class GStreamerObject:
         1. 标记 _ready=False 阻止继续 push
         2. _cleanup_internal() → 带超时地释放所有资源
         """
-        if not self._pipeline:
+        if not (self._pipeline or self._appsrc or self._rtsp_factory or self._ready):
             return
         print(f"[{self._gst_cfg.label}] destroy_pipe...")
         self._cleanup_internal()

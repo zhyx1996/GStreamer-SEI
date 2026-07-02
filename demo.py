@@ -35,7 +35,7 @@ VIDEO_PATH = r"D:\Navigation\Code\gst\test.mp4"
 # =============================================
 
 
-def make_gst_config():
+def make_gst_config(mount=RTSP_MOUNT, label="gst-demo"):
     """创建 GStreamer 配置"""
     cfg = GStreamerConfig()
     cfg.input_width = CAMERA_WIDTH
@@ -47,9 +47,9 @@ def make_gst_config():
     cfg.output_mode = "rtsp_server"  # rtsp_server / rtsp
     cfg.output_host = "0.0.0.0"
     cfg.output_port = RTSP_SERVER_PORT
-    cfg.rtsp_mount = RTSP_MOUNT
-    cfg.output_url = RTSP_URL
-    cfg.label = "gst-demo"
+    cfg.rtsp_mount = mount
+    cfg.output_url = f"rtsp://127.0.0.1:{RTSP_SERVER_PORT}{mount}"
+    cfg.label = label
     return cfg
 
 
@@ -107,18 +107,12 @@ def run_carla_mode():
     CAM_GAMMA = 2.2
     CAM_SENSOR_TICK = 0.1
 
-    # 默认推流使用相机 1 (front_left)
+    # 默认终端状态关注相机 1 (front_left)
     ACTIVE_CAMERA_INDEX = 0  # 0=front_left, 1=top
-
-    # ---- 初始化 GStreamer ----
-    cfg = make_gst_config()
-    gst = GStreamerObject(cfg)
-    if not gst.initialize_pipe():
-        print("[FATAL] GStreamer pipeline 启动失败")
-        return
 
     vehicle = None
     cameras = []
+    gst_streams = []
     try:
         # 连接 Carla
         client = carla.Client(CARLA_HOST, CARLA_PORT)
@@ -130,7 +124,9 @@ def run_carla_mode():
         settings.synchronous_mode = True
         settings.fixed_delta_seconds = 1.0 / CAMERA_FPS
         world.apply_settings(settings)
-        world.tick()
+        tick_t0 = time.perf_counter()
+        first_tick_frame = world.tick()
+        print(f"[耗时] 首次仿真推进: 帧={first_tick_frame} 耗时={(time.perf_counter() - tick_t0) * 1000.0:.3f}ms", flush=True)
 
         # ---- 创建车辆 (固定位姿) ----
         vehicle_bp = world.get_blueprint_library().find(VEHICLE_MODEL)
@@ -144,6 +140,7 @@ def run_carla_mode():
         camera_configs = [
             {
                 "name": "front_left",
+                "mount": RTSP_MOUNT,
                 "location": CAM1_LOCATION,
                 "rotation": CAM1_ROTATION,
                 "fov": CAM1_FOV,
@@ -151,6 +148,7 @@ def run_carla_mode():
             },
             {
                 "name": "top",
+                "mount": "/stream/cam_top",
                 "location": CAM2_LOCATION,
                 "rotation": CAM2_ROTATION,
                 "fov": CAM2_FOV,
@@ -158,7 +156,31 @@ def run_carla_mode():
             },
         ]
 
+        for cam_cfg in camera_configs:
+            cfg = make_gst_config(cam_cfg["mount"], f"gst-{cam_cfg['name']}")
+            gst = GStreamerObject(cfg)
+            if not gst.initialize_pipe():
+                print(f"[FATAL] GStreamer pipeline 启动失败: {cam_cfg['name']}")
+                return
+            gst_streams.append(gst)
+            print(f"[demo] RTSP[{cam_cfg['name']}]: rtsp://127.0.0.1:{RTSP_SERVER_PORT}{cam_cfg['mount']}")
+
         image_queues = []
+
+        def make_sensor_callback(cam_name, q):
+            def _on_sensor_image(image):
+                if q.full():
+                    try:
+                        q.get_nowait()
+                    except queue.Empty:
+                        pass
+                try:
+                    q.put_nowait(image)
+                except queue.Full:
+                    pass
+
+            return _on_sensor_image
+
         for cam_cfg in camera_configs:
             cam_bp = world.get_blueprint_library().find("sensor.camera.rgb")
             cam_bp.set_attribute("image_size_x", str(CAM_IMAGE_W))
@@ -173,8 +195,8 @@ def run_carla_mode():
             cam = world.spawn_actor(cam_bp, cam_transform, attach_to=vehicle)
             cameras.append(cam)
 
-            q = queue.Queue()
-            cam.listen(q.put)
+            q = queue.Queue(maxsize=1)
+            cam.listen(make_sensor_callback(cam_cfg["name"], q))
             image_queues.append(q)
             print(f"[demo] 创建相机 [{cam_cfg['name']}]: id={cam.id}, "
                   f"pos=({cam_cfg['location'].x}, {cam_cfg['location'].y}, {cam_cfg['location'].z}), "
@@ -190,13 +212,13 @@ def run_carla_mode():
         active_cam = ACTIVE_CAMERA_INDEX
 
         print("=" * 60)
-        print(f"[demo] 开始推流 -> {RTSP_URL} (终端键盘控制模式)")
+        print(f"[demo] 开始双路推流 -> rtsp://127.0.0.1:{RTSP_SERVER_PORT}{RTSP_MOUNT} 和 /stream/top (终端键盘控制模式)")
         print("=" * 60)
         print("控制键:")
         print("  W/S    = 加速/减速 (速度 ±0.1 m/s)")
         print("  A/D    = 左转/右转 (转向 ±5°)")
         print("  Q      = 方向盘回正")
-        print("  1/2    = 切换相机 (1=front_left, 2=top)")
+        print("  1/2    = 切换状态关注相机 (1=front_left, 2=top；两路始终同时推流)")
         print("  ESC/X  = 退出程序")
         print(f"速度范围: [{SPEED_MIN_LIMIT}, {SPEED_MAX_LIMIT}] m/s")
         print(f"转向范围: [{LEFT_STEER_MAX}, {RIGHT_STEER_MAX}] deg")
@@ -207,7 +229,13 @@ def run_carla_mode():
 
         # ---- 主循环 ----
         while True:
+            loop_t0 = time.perf_counter()
+            key_ms = control_ms = apply_ms = tick_ms = sleep_ms = 0.0
+            tick_frame = None
+            stream_stats = []
+
             # ---- 终端键盘输入检测 ----
+            key_t0 = time.perf_counter()
             if msvcrt.kbhit():
                 key = msvcrt.getch()
                 # 处理特殊键 (方向键等返回 b'\xe0' 或 b'\x00')
@@ -241,15 +269,17 @@ def run_carla_mode():
                     steer_angle = 0.0
                     print(f"[控制] 方向盘回正")
                 
-                # 相机切换
+                # 状态关注相机切换
                 elif key_char == '1':
                     active_cam = 0
-                    print(f"[控制] 切换到相机: {cam_names[active_cam]}")
+                    print(f"[控制] 状态关注相机: {cam_names[active_cam]}")
                 elif key_char == '2':
                     active_cam = 1
-                    print(f"[控制] 切换到相机: {cam_names[active_cam]}")
+                    print(f"[控制] 状态关注相机: {cam_names[active_cam]}")
+            key_ms = (time.perf_counter() - key_t0) * 1000.0
 
             # ---- 速度 P 控制器 → throttle/brake ----
+            control_t0 = time.perf_counter()
             current_speed = math.sqrt(
                 vehicle.get_velocity().x ** 2 +
                 vehicle.get_velocity().y ** 2 +
@@ -264,6 +294,7 @@ def run_carla_mode():
 
             # Carla steer 归一化到 [-1, 1]
             steer_norm = max(-1.0, min(steer_angle / abs(LEFT_STEER_MAX), 1.0))
+            control_ms = (time.perf_counter() - control_t0) * 1000.0
 
             control = carla.VehicleControl(
                 throttle=throttle_cmd,
@@ -272,24 +303,46 @@ def run_carla_mode():
                 hand_brake=False,
                 reverse=False,
             )
+            apply_t0 = time.perf_counter()
             vehicle.apply_control(control)
+            apply_ms = (time.perf_counter() - apply_t0) * 1000.0
 
             # 推进仿真
-            world.tick()
+            tick_t0 = time.perf_counter()
+            tick_frame = world.tick()
+            tick_ms = (time.perf_counter() - tick_t0) * 1000.0
 
-            # 取帧并推流 (使用当前活动相机)
-            try:
-                image = image_queues[active_cam].get(timeout=1.0)
-                gst.send_carla_frame(image)
-                frame_count += 1
-                # 每 100 帧打印一次状态
-                if frame_count % 100 == 0:
-                    print(f"[状态] 帧={frame_count} | 速度={current_speed:.1f}/{target_speed:.1f} m/s | 转向={steer_angle:.0f}° | 相机={cam_names[active_cam]}")
-            except queue.Empty:
-                pass
+            # 取帧并推流: 每个相机一路 RTSP
+            for idx, cam_name in enumerate(cam_names):
+                image = None
+                get_t0 = time.perf_counter()
+                try:
+                    image = image_queues[idx].get(timeout=1.0)
+                    get_ms = (time.perf_counter() - get_t0) * 1000.0
+                except queue.Empty:
+                    get_ms = (time.perf_counter() - get_t0) * 1000.0
+                    print(f"[WARN] 相机取图超时: 相机={cam_name} 等待={get_ms:.3f}ms", flush=True)
+                    stream_stats.append(f"{cam_name}: 获取CARLA图片={get_ms:.3f}ms 推流=跳过")
+                    continue
+
+                send_t0 = time.perf_counter()
+                gst_streams[idx].send_carla_frame(image)
+                send_ms = (time.perf_counter() - send_t0) * 1000.0
+                stream_stats.append(
+                    f"{cam_name}: 图像帧={image.frame} 获取CARLA图片={get_ms:.3f}ms 推流={send_ms:.3f}ms"
+                )
+
+            frame_count += 1
+            # 每 100 帧打印一次状态
+            if frame_count % 100 == 0:
+                print(f"[状态] 帧={frame_count} | 速度={current_speed:.1f}/{target_speed:.1f} m/s | 转向={steer_angle:.0f}° | 关注相机={cam_names[active_cam]}")
 
             # 帧率控制
+            sleep_t0 = time.perf_counter()
             time.sleep(frame_interval * 0.5)  # 留一些时间给键盘检测
+            sleep_ms = (time.perf_counter() - sleep_t0) * 1000.0
+
+            print(f"[推流耗时] 已推帧={frame_count} " + " | ".join(stream_stats), flush=True)
 
     except KeyboardInterrupt:
         print("\n[demo] 用户中断")
@@ -302,7 +355,8 @@ def run_carla_mode():
             print(f"[demo] 已销毁相机 id={cam.id}")
         settings.synchronous_mode = False
         world.apply_settings(settings)
-        gst.destroy_pipe()
+        for gst in gst_streams:
+            gst.destroy_pipe()
         print("[demo] 清理完成")
 
 
