@@ -16,6 +16,7 @@ hiddenimports = [
     "gi._option",
     "gi.repository.Gst",
     "gi.repository.GstApp",
+    "gi.repository.GstRtspServer",
     "gi.repository.GLib",
     "gi.repository.GObject",
     "gi.repository.Gio",
