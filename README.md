@@ -1,6 +1,6 @@
 # GStreamer-SEI
 
-基于 GStreamer 的视频推流工具，在 H.264/H.265 码流中注入自定义 SEI NAL 单元，可用于传递CARLA仿真的时间戳。
+基于 GStreamer 的视频推流工具，在 H.264/H.265 码流中注入自定义 SEI NAL 单元，可用于传递 CARLA 仿真时间戳。
 
 因为没找到合适的教程，就从头写了……
 
@@ -27,7 +27,10 @@ from gst_streaming import GStreamerConfig, GStreamerObject
 
 cfg = GStreamerConfig()
 cfg.vcodec = "auto"  # 自动检测 nvh265enc，否则回退 x265enc
-cfg.output_mode = "rtsp"
+cfg.output_mode = "rtsp_server"  # 或 "rtsp" 推到 MediaMTX
+cfg.output_host = "0.0.0.0"
+cfg.output_port = 8554
+cfg.rtsp_mount = "/stream/cam_front_left"
 cfg.output_url = "rtsp://127.0.0.1:8554/stream/cam_front_left"
 
 gst = GStreamerObject(cfg)
@@ -56,13 +59,13 @@ python demo.py --carla
 D:\Navigation\Code\gst\test.mp4
 ```
 
-并推流到：
+默认会启动内置 RTSP Server，监听：
 
 ```text
 rtsp://127.0.0.1:8554/stream/cam_front_left
 ```
 
-运行前需要先启动 RTSP 中继服务，例如 [MediaMTX](https://github.com/bluenviron/mediamtx)。拉流测试命令：
+拉流测试命令：
 
 ```bash
 ffplay -fflags nobuffer -flags low_delay -framedrop rtsp://127.0.0.1:8554/stream/cam_front_left
@@ -73,6 +76,15 @@ ffplay -fflags nobuffer -flags low_delay -framedrop rtsp://127.0.0.1:8554/stream
 ```bash
 gst-launch-1.0 rtspsrc location=rtsp://127.0.0.1:8554/stream/cam_front_left latency=0 drop-on-latency=true buffer-mode=3 ! rtph265depay ! h265parse ! nvh265dec ! d3d11videosink sync=false
 ```
+
+如果想改回推流到 [MediaMTX](https://github.com/bluenviron/mediamtx)，将 `demo.py` / `GStreamerConfig` 中的输出模式改为：
+
+```python
+cfg.output_mode = "rtsp"
+cfg.output_url = "rtsp://127.0.0.1:8554/stream/cam_front_left"
+```
+
+并先启动 MediaMTX。
 
 ## PyInstaller 打包
 
@@ -109,7 +121,24 @@ gstreamer_libs.setup_python_environment()
 | `udp` | RTP over UDP，无连接低延迟 | AI写的，我没试 |
 | `tcp` | RTP over TCP，可靠传输 | 同上 |
 | `srt` | SRT 协议，低延迟可靠，适合公网 | 同上 |
-| `rtsp` | 推流到 RTSP 服务器（自动选 payloader） | 已测试 |
+| `rtsp` | 使用 `rtspclientsink` 推流到 MediaMTX 等 RTSP 服务器 | 已测试 |
+| `rtsp_server` | 本进程启动 `gst-rtsp-server`，客户端直接拉流 | 已测试 |
+
+`rtsp_server` 模式中 payloader 必须命名为 `pay0`，这是 `gst-rtsp-server` 的约定，用于把该 payloader 映射为第 0 路 RTSP media track。
+
+编码流 caps 统一显式指定为：
+
+```text
+video/x-h265,stream-format=byte-stream,alignment=au
+```
+
+或 H.264：
+
+```text
+video/x-h264,stream-format=byte-stream,alignment=au
+```
+
+`alignment=au` 表示 parser 输出按 access unit（完整访问单元/帧语义）对齐，比默认协商更稳定，尤其适合在 parser 后插入 SEI 再交给 RTP payloader。
 
 ## SEI 格式
 
@@ -121,6 +150,19 @@ payloadType: C8        (200, 自定义)
 payloadSize: 09
 payload:    3B + 8 字节 big-endian uint64 UTC 微秒时间戳
 ```
+
+发送端会在 parser 的 src pad 后注入 SEI。若使用 `vcodec="auto"`，代码会保存实际选择的编码器，避免 H.265 流误注入 H.264 SEI header。
+
+## Windows 日志说明
+
+使用 `gstreamer-bundle` 的 `gst-launch-1.0` 拉流时，可能看到类似：
+
+```text
+giolibproxy.dll: 找不到指定的模块
+Failed to load module ... giolibproxy.dll
+```
+
+这通常是 GIO proxy 模块的依赖警告，对本机 RTSP 拉流一般无影响。若使用 `d3d11videosink` / `nvh265dec`，还会打印 D3D11、CUDA context 信息，也属于客户端显示/解码侧日志。
 
 ## 解码端 (C++)
 

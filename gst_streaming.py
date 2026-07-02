@@ -52,7 +52,8 @@ gstreamer_libs.setup_python_environment()
 import gi
 gi.require_version("Gst", "1.0")     # GStreamer 1.x GI 绑定
 gi.require_version("GstApp", "1.0")  # GstApp 绑定 (appsrc 的 Python 接口)
-from gi.repository import Gst, GstApp, GLib
+gi.require_version("GstRtspServer", "1.0")  # 内置 RTSP Server
+from gi.repository import Gst, GstApp, GstRtspServer, GLib
 
 # Gst.init 初始化 GStreamer 内部状态: 类型注册 / 插件扫描 / registry 缓存。
 # 必须传 sys.argv (新版 pygobject Gst.init(None) 会 TypeError)。
@@ -99,11 +100,12 @@ class GStreamerConfig:
         #   "tcp"  = RTP over TCP (可靠, 轻微延迟)
         #   "srt"  = SRT 协议 (低延迟+可靠传输, 适合公网)
         #   "rtsp" = 推流到 MediaMTX 等 RTSP 中继服务器
-        self.output_mode: str = "rtsp"            # rtsp: 直接推流到 RTSP 服务器
-        self.output_host: str = "127.0.0.1"       # RTSP 服务器 IP
-        self.output_port: int = 8554              # RTSP 服务器端口
+        #   "rtsp_server" = 本进程启动 RTSP Server, 客户端直接拉流
+        self.output_mode: str = "rtsp_server"               # rtsp: 直接推流到 RTSP 服务器
+        self.output_host: str = "0.0.0.0"                   # RTSP 服务器 IP (0.0.0.0 = 监听所有网卡, 允许远程连接)
+        self.output_port: int = 8554                        # RTSP 服务器端口
+        self.rtsp_mount: str = "/stream/cam_front_left"     # 挂载点路径
         self.output_url: str = "rtsp://127.0.0.1:8554/stream/cam_front_left"  # RTSP 推流地址
-        self.rtsp_mount: str = "/stream/cam_front_left"    # 挂载点路径
 
         # ── 杂项 ──
         self.label: str = "gst-carla"            # 日志标签, 区分多实例
@@ -134,6 +136,10 @@ class GStreamerObject:
         self._main_loop: GLib.MainLoop = None    # GLib 事件循环, 处理信号/回调
         self._loop_thread: threading.Thread = None  # 后台线程, 运行 main_loop.run()
         self._ready: bool = False                # pipeline 是否就绪 (可 push 帧)
+        self._rtsp_server: GstRtspServer.RTSPServer = None
+        self._rtsp_factory: GstRtspServer.RTSPMediaFactory = None
+        self._rtsp_source_id: int = 0
+        self._actual_vcodec: str = gst_cfg.vcodec # auto 解析后的实际编码器, 供 SEI NAL 类型判断
         self._sei_ts_queue: collections.deque = collections.deque(maxlen=5)  # FIFO, zerolatency保证1:1
         self._sei_lock = threading.Lock()         # 保护 _sei_ts_queue 的跨线程读写
 
@@ -215,48 +221,64 @@ class GStreamerObject:
             return f"rtspclientsink location={url} latency=0 protocols=tcp rtx-time=200"
         raise ValueError(f"Unsupported output_mode: {m}")
 
-    def _build_pipeline_string(self) -> str:
-        """
-        构建完整 GStreamer pipeline 字符串。
-        """
+    def _build_video_chain(self) -> tuple[str, bool]:
+        """构建 appsrc 到 parser/caps 的公共视频链, 返回 (pipeline片段, 是否H265)。"""
         w, h, fps = self._gst_cfg.input_width, self._gst_cfg.input_height, self._gst_cfg.input_fps
         pix = self._gst_cfg.input_pix_fmt
         vcodec = self._gst_cfg.vcodec
         if vcodec == "auto":
             vcodec = self._detect_best_encoder()
+        self._actual_vcodec = vcodec
 
         # 根据编码器类型选择对应参数 (H.265 vs H.264)
         is_h265 = self._is_h265(vcodec)
         parser = "h265parse name=parser config-interval=-1" if is_h265 else "h264parse name=parser config-interval=-1"
-        stream_caps = "video/x-h265,stream-format=byte-stream" if is_h265 else "video/x-h264,stream-format=byte-stream"
-        payloader = "rtph265pay config-interval=1 pt=96" if is_h265 else "rtph264pay config-interval=1 pt=96"
-
         # NVENC 硬件编码器需要 NV12 格式, 软件编码器用 I420
         enc_fmt = "NV12" if "nv" in vcodec.lower() else "I420"
 
         # 构建编码器段 (复用已解析的 vcodec)
         encoder_seg = self._build_encoder_segment(vcodec)
 
+        stream_caps = (
+            "video/x-h265,stream-format=byte-stream,alignment=au"
+            if is_h265
+            else "video/x-h264,stream-format=byte-stream,alignment=au"
+        )
+
+        chain = (
+            f"appsrc name=mysrc is-live=true block=true format=time do-timestamp=true "
+            f"caps=video/x-raw,format={pix},width={w},height={h},framerate={fps}/1 ! "
+            f"videoconvert ! video/x-raw,format={enc_fmt} ! "
+            f"{encoder_seg} ! "
+            f"{parser} ! {stream_caps}"
+        )
+        return chain, is_h265
+
+    def _build_pipeline_string(self) -> str:
+        """
+        构建完整 GStreamer pipeline 字符串。
+        """
+        chain, is_h265 = self._build_video_chain()
+        payloader = "rtph265pay config-interval=1 pt=96" if is_h265 else "rtph264pay config-interval=1 pt=96"
+
         # RTSP 模式不需要 RTP payloader (rtspclientsink 自动处理)
         if self._gst_cfg.output_mode == "rtsp":
             return (
-                f"appsrc name=mysrc is-live=true block=true format=time "
-                f"caps=video/x-raw,format={pix},width={w},height={h},framerate={fps}/1 ! "
-                f"videoconvert ! video/x-raw,format={enc_fmt} ! "
-                f"{encoder_seg} ! "
-                f"{parser} ! {stream_caps} ! "
+                f"{chain} ! "
                 f"{self._build_output_segment()}"
             )
         else:
             return (
-                f"appsrc name=mysrc is-live=true block=true format=time "
-                f"caps=video/x-raw,format={pix},width={w},height={h},framerate={fps}/1 ! "
-                f"videoconvert ! video/x-raw,format={enc_fmt} ! "
-                f"{encoder_seg} ! "
-                f"{parser} ! "
+                f"{chain} ! "
                 f"{payloader} ! "
                 f"{self._build_output_segment()}"
             )
+
+    def _build_rtsp_server_launch(self) -> str:
+        """构建 gst-rtsp-server factory launch 字符串。payloader 必须命名为 pay0。"""
+        chain, is_h265 = self._build_video_chain()
+        payloader = "rtph265pay name=pay0 config-interval=1 pt=96" if is_h265 else "rtph264pay name=pay0 config-interval=1 pt=96"
+        return f"( {chain} ! {payloader} )"
 
     # ==========================================================================
     #  生命周期: 启动 pipeline
@@ -276,6 +298,11 @@ class GStreamerObject:
 
         Returns: True 成功 / False 失败
         """
+
+        # 如果使用内置RTSP server，则转到_initialize_rtsp_server
+        if self._gst_cfg.output_mode == "rtsp_server":
+            return self._initialize_rtsp_server()
+
         try:
             pipeline_str = self._build_pipeline_string()
             print(f"[{self._gst_cfg.label}] pipeline:\n  {pipeline_str}")
@@ -287,28 +314,14 @@ class GStreamerObject:
             if not self._appsrc:
                 raise RuntimeError("appsrc 'mysrc' not found")
 
-            # 挂载 SEI 注入 probe 到 parser 的 src pad
-            # 在 parser 处理完码流之后再注入 SEI，避免 parser 截断 SEI NAL
-            parser = self._pipeline.get_by_name("parser")
-            if parser:
-                src_pad = parser.get_static_pad("src")
-                if src_pad:
-                    src_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_encoder_output, None)
-                    print(f"[{self._gst_cfg.label}] SEI probe attached to parser src pad")
+            self._attach_sei_probe(self._pipeline)
 
             # 监听 bus (异步, GLib 线程触发)
             bus = self._pipeline.get_bus()
             bus.add_signal_watch()
             bus.connect("message", self._on_bus_message)
 
-            # daemon 线程运行 GLib 主循环
-            self._main_loop = GLib.MainLoop.new(None, False)
-            self._loop_thread = threading.Thread(
-                target=self._main_loop.run,
-                name=f"gst-loop-{self._gst_cfg.label}",
-                daemon=True,
-            )
-            self._loop_thread.start()
+            self._ensure_main_loop()
 
             # NULL → READY → PAUSED → PLAYING
             if self._pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
@@ -325,6 +338,81 @@ class GStreamerObject:
             print(f"[{self._gst_cfg.label}] initialize_pipe failed: {e}")
             self._cleanup_internal()
             return False
+
+    def _ensure_main_loop(self):
+        """确保 GLib 主循环在后台运行。"""
+        if self._main_loop and self._loop_thread and self._loop_thread.is_alive():
+            return
+        self._main_loop = GLib.MainLoop.new(None, False)
+        self._loop_thread = threading.Thread(
+            target=self._main_loop.run,
+            name=f"gst-loop-{self._gst_cfg.label}",
+            daemon=True,
+        )
+        self._loop_thread.start()
+
+    def _attach_sei_probe(self, element):
+        """给指定 pipeline/bin 里的 parser src pad 挂 SEI 注入 probe。"""
+        parser = element.get_by_name("parser") if element else None
+        if not parser:
+            return
+        src_pad = parser.get_static_pad("src")
+        if src_pad:
+            src_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_encoder_output, None)
+            print(f"[{self._gst_cfg.label}] SEI probe attached to parser src pad")
+
+    def _initialize_rtsp_server(self) -> bool:
+        """启动内置 gst-rtsp-server，客户端连接后通过 appsrc 推实时帧。"""
+        try:
+            launch = self._build_rtsp_server_launch()
+            mount = self._gst_cfg.rtsp_mount if self._gst_cfg.rtsp_mount.startswith("/") else f"/{self._gst_cfg.rtsp_mount}"
+            print(f"[{self._gst_cfg.label}] RTSP server launch:\n  {launch}")
+
+            self._ensure_main_loop()
+
+            self._rtsp_server = GstRtspServer.RTSPServer.new()
+            self._rtsp_server.set_service(str(self._gst_cfg.output_port))
+            if self._gst_cfg.output_host:
+                self._rtsp_server.set_address(self._gst_cfg.output_host)
+
+            self._rtsp_factory = GstRtspServer.RTSPMediaFactory.new()
+            self._rtsp_factory.set_launch(launch)
+            self._rtsp_factory.set_shared(True)
+            self._rtsp_factory.connect("media-configure", self._on_rtsp_media_configure)
+
+            mounts = self._rtsp_server.get_mount_points()
+            mounts.add_factory(mount, self._rtsp_factory)
+
+            self._rtsp_source_id = self._rtsp_server.attach(None)
+            if self._rtsp_source_id == 0:
+                raise RuntimeError("Failed to attach RTSP server")
+
+            self._ready = True
+            print(f"[{self._gst_cfg.label}] RTSP server ready: rtsp://{self._gst_cfg.output_host}:{self._gst_cfg.output_port}{mount}")
+            return True
+        except Exception as e:
+            traceback.print_exc()
+            print(f"[{self._gst_cfg.label}] initialize RTSP server failed: {e}")
+            self._cleanup_internal()
+            return False
+
+    def _on_rtsp_media_configure(self, factory, media):
+        """客户端首次连接时 gst-rtsp-server 创建 media pipeline，在这里拿 appsrc。"""
+        element = media.get_element()
+        self._pipeline = element
+        self._appsrc = element.get_by_name("mysrc")
+        if not self._appsrc:
+            print(f"[ERROR] {self._gst_cfg.label} RTSP server appsrc 'mysrc' not found")
+            return
+        self._attach_sei_probe(element)
+        media.connect("unprepared", self._on_rtsp_media_unprepared)
+        print(f"[{self._gst_cfg.label}] RTSP client connected, appsrc ready")
+
+    def _on_rtsp_media_unprepared(self, media):
+        """共享 media 释放后清掉 appsrc，避免继续 push 到失效对象。"""
+        self._appsrc = None
+        self._pipeline = None
+        print(f"[{self._gst_cfg.label}] RTSP media unprepared, appsrc cleared")
 
     # ==========================================================================
     #  发送帧 (对外接口)
@@ -398,9 +486,10 @@ class GStreamerObject:
         # FIFO 出队: zerolatency+bframes=0 保证 push-buffer 与 probe 1:1
         with self._sei_lock:
             ts_us = self._sei_ts_queue.popleft() if self._sei_ts_queue else 0
-        print(f"[{self._gst_cfg.label}] probe SEI us={ts_us}  queue_left={len(self._sei_ts_queue)}")
+        print(f"[{self._gst_cfg.label}] probe SEI us={ts_us}  PTS={buffer.pts} ns  queue_left={len(self._sei_ts_queue)}")
 
-        is_h265 = self._is_h265(self._gst_cfg.vcodec)
+        vcodec = self._actual_vcodec or self._gst_cfg.vcodec
+        is_h265 = self._is_h265(vcodec)
 
         # 构造 SEI payload (RBSP, 需做防竞争处理)
         # HACK: 理应对NAL整体做防竞争处理, 但本SEI中payload之外不会出现起始码
@@ -440,12 +529,17 @@ class GStreamerObject:
             0x00, 0x00, 0x00, 0x01,  # start code
         ])
         if is_h265:
-            sei_nal += bytearray([0x4E, 0x01])  # H.265 NAL header (type=39, layer=0, tid=1)
+            sei_nal += bytearray([0x4E, 0x01])      # H.265 NAL header (type=39, layer=0, tid=1)
         else:
-            sei_nal += bytearray([0x06])         # H.264 NAL header (type=6)
-        sei_nal += bytearray([0xC8])             # payloadType = 200
-        sei_nal += bytearray([len(sei_payload)]) # payloadSize (RBSP 大小, 固定 9)
-        sei_nal += ebsp_payload                  # 已做防竞争处理的 payload (EBSP)
+            sei_nal += bytearray([0x06])            # H.264 NAL header (type=6)
+        sei_nal += bytearray([0xC8])                # payloadType = 200
+        sei_nal += bytearray([len(sei_payload)])    # payloadSize (RBSP 大小, 固定 9)
+        sei_nal += ebsp_payload                     # 已做防竞争处理的 payload (EBSP)
+
+        # print(
+        #     f"[{self._gst_cfg.label}] SEI codec={vcodec} len={len(sei_nal)} hex={sei_nal.hex(' ')}",
+        #     flush=True,
+        # )
 
         # 创建 SEI buffer
         sei_buf = Gst.Buffer.new_allocate(None, len(sei_nal), None)
@@ -466,9 +560,14 @@ class GStreamerObject:
         在 parser 的 sink pad 上拦截每个 buffer, 读取 _last_timestamp_us,
         构造 SEI NAL 并插入到 buffer 前面。
         """
+        # t0 = time.perf_counter()
+
         buffer = info.get_buffer()
         new_buf = self._inject_sei(buffer)
         info.set_buffer(new_buf)
+
+        # dt_us = (time.perf_counter() - t0) * 1_000_000
+        # print(f"[{self._gst_cfg.label}] probe耗时 dt={dt_us:.1f} us")
         return Gst.PadProbeReturn.OK
 
     def _on_bus_message(self, bus, msg):
@@ -494,6 +593,14 @@ class GStreamerObject:
     def _cleanup_internal(self):
         """内部清理, 安全可重入。"""
         self._ready = False
+        if self._rtsp_source_id:
+            try:
+                GLib.source_remove(self._rtsp_source_id)
+            except Exception:
+                pass
+            self._rtsp_source_id = 0
+        self._rtsp_factory = None
+        self._rtsp_server = None
         # pipeline → NULL: 释放编码器上下文、网络连接等
         # 用线程 + 超时防止阻塞 (rtspclientsink 网络超时可能很久)
         if self._pipeline:
