@@ -28,6 +28,7 @@ import time        # sleep (等待 pipeline 状态切换)
 import traceback   # 异常时打印调用栈
 import threading   # GLib.MainLoop 运行在 daemon 线程
 import collections # deque (SEI 时间戳 FIFO)
+import socket      # RTSP server 端口占用预检查
 import numpy as np # 仅 timestamp overlay 场景用, 不影响模块加载
 
 # 为pyinstaller打包设置环境(仅适用于pip install gstreamer-bundle安装)
@@ -159,6 +160,21 @@ class SharedRtspServer:
         cls._loop_thread.start()
 
     @classmethod
+    def _check_port_available(cls, host: str, port: int):
+        """提前检查监听端口，给出比 RTSPServer.attach() 更明确的错误。"""
+        bind_host = host or "0.0.0.0"
+        family = socket.AF_INET6 if ":" in bind_host else socket.AF_INET
+        with socket.socket(family, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.bind((bind_host, int(port)))
+            except OSError as e:
+                raise RuntimeError(
+                    f"RTSP server 无法监听 {bind_host}:{port}，通常是端口已被占用。"
+                    f"请检查 MediaMTX、旧 demo/python 进程或其他 RTSP server。系统错误: {e}"
+                ) from e
+
+    @classmethod
     def add_factory(cls, host: str, port: int, mount: str, factory: GstRtspServer.RTSPMediaFactory):
         """
         注册一路 RTSP 媒体流到共享 server。
@@ -189,6 +205,7 @@ class SharedRtspServer:
 
             entry = cls._servers.get(key)
             if entry is None:
+                cls._check_port_available(key[0], key[1])
                 # --- 首次使用该 (host, port): 创建新的 RTSPServer ---
                 server = GstRtspServer.RTSPServer.new()
                 server.set_service(str(port))   # 设置端口
@@ -197,7 +214,7 @@ class SharedRtspServer:
                 # attach 到 GLib 默认主上下文，返回该 server 的 source ID（用于后续销毁）
                 source_id = server.attach(None)
                 if source_id == 0:
-                    raise RuntimeError(f"Failed to attach RTSP server on {key[0]}:{key[1]}")
+                    raise RuntimeError(f"RTSP server attach 失败: {key[0]}:{key[1]}")
                 entry = {
                     "server": server,
                     "source_id": source_id,
@@ -633,7 +650,7 @@ class GStreamerObject:
         # FIFO 出队: zerolatency+bframes=0 保证 push-buffer 与 probe 1:1
         with self._sei_lock:
             ts_us = self._sei_ts_queue.popleft() if self._sei_ts_queue else 0
-        print(f"[{self._gst_cfg.label}] probe SEI us={ts_us}  PTS={buffer.pts} ns  queue_left={len(self._sei_ts_queue)}")
+        # print(f"[{self._gst_cfg.label}] probe SEI us={ts_us}  PTS={buffer.pts} ns  queue_left={len(self._sei_ts_queue)}")
 
         vcodec = self._actual_vcodec or self._gst_cfg.vcodec
         is_h265 = self._is_h265(vcodec)

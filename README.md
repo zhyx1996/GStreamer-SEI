@@ -9,10 +9,10 @@
 推荐直接使用 pip 版本的 GStreamer bundle：
 
 ```bash
-pip install gstreamer-bundle opencv-python numpy
+pip install gstreamer-bundle opencv-python numpy pyyaml
 ```
 
-如果需要运行 `demo.py --carla`，还需要安装对应版本的 CARLA Python 包。
+如果需要运行 `demo.py --carla` 或 `carla_camera.py`，还需要安装对应版本的 CARLA Python 包。
 
 或使用官方安装程序 (Windows)：
 
@@ -86,6 +86,52 @@ cfg.output_url = "rtsp://127.0.0.1:8554/stream/cam_front_left"
 
 并先启动 MediaMTX。
 
+## 现有 CARLA 车辆挂载相机
+
+`carla_camera.py` 用于连接已有 CARLA world，查找已存在车辆，并把一个或多个相机 attach 到该车辆上推 RTSP。它不会创建车辆，也不会设置 `fixed_delta_seconds` 或调用 `world.tick()`，适合由其他主控程序负责车辆控制和仿真推进的场景。
+
+默认读取当前目录下的 `config.yaml`：
+
+```bash
+python carla_camera.py
+```
+
+也可以显式指定配置：
+
+```bash
+python carla_camera.py --config config.yaml
+```
+
+车辆查找配置示例：
+
+```yaml
+vehicle:
+  label: Car_001
+  model: vehicle.lincoln.mkz_2020
+  role_name: car
+```
+
+其中 `role_name` 是推荐的匹配字段；如果同一个 world 里有多辆车都匹配，请在配置里填写 `actor_id` 精确指定。`label` 主要用于配置可读性，CARLA actor 默认不一定带这个属性。
+
+相机配置示例：
+
+```yaml
+cameras:
+  - enable: true
+    sensor_type: sensor.camera.rgb
+    role_name: car_001_camera_rgb_front_left
+    location: { x: 3.0, y: -2.1, z: 1.9 }
+    rotation: { pitch: -38.0, yaw: -90.0, roll: 0.0 }
+    image_size_x: 1920
+    image_size_y: 1080
+    sensor_tick: 0.1
+    stream:
+      mount: /stream/cam_front_left
+      label: gst-front-left
+```
+
+`sensor_tick` 是相机采样间隔，不是 world tick。多相机时，在 `cameras` 数组里继续追加条目即可；RTSP server 会复用同一个端口，通过不同 mount 输出多路流。
+
 ## PyInstaller 打包
 
 仓库提供了 `demo.spec`，用于将 `demo.py` 打包为单文件 exe：
@@ -93,6 +139,14 @@ cfg.output_url = "rtsp://127.0.0.1:8554/stream/cam_front_left"
 ```bash
 pyinstaller --noconfirm demo.spec
 ```
+
+`carla_camera.py` 对应 `carla_camera.spec`：
+
+```bash
+pyinstaller --noconfirm carla_camera.spec
+```
+
+`carla_camera.spec` 不会把 `config.yaml` 打进 exe；运行时请把 `carla_camera.exe` 和 `config.yaml` 放在同一目录，或从包含 `config.yaml` 的目录启动 exe。该 spec 将 exe 输出到当前目录，而不是默认的 `dist` 目录。
 
 `gst_streaming.py` 会在 `import gi` 前执行：
 

@@ -1,0 +1,75 @@
+# CARLA 连接配置
+carla:
+  host: 127.0.0.1
+  port: 3000
+  timeout: 10.0
+
+# 要 attach 的现有车辆
+# 推荐优先用 role_name；如果匹配到多辆车，再填写 actor_id 精确指定。
+vehicle:
+  label: Car_001
+  # actor_id: 123
+  model: vehicle.lincoln.mkz_2020
+  role_name: car
+
+# GStreamer / RTSP 默认推流配置
+# 每个 camera.stream 可以覆盖这里的默认值。
+stream:
+  output_mode: rtsp_server
+  output_host: 0.0.0.0
+  output_port: 8555
+  input_pix_fmt: BGRA
+  vcodec: auto
+  video_bitrate: 4000k
+
+# 支持单车辆多相机：继续在 cameras 下追加相机即可。
+cameras:
+  - comment: "Install on the front-left side of vehicle"
+    label: Car_001
+    enable: true
+    sensor_type: sensor.camera.rgb
+    role_name: car_001_camera_rgb_front_left
+    id: 1
+    location:
+      x: 3.0
+      y: -2.1
+      z: 1.9
+    rotation:
+      pitch: -38.0
+      yaw: -90.0
+      roll: 0.0
+    fov: 120.0
+    fstop: 1.4
+    image_size_x: 1920
+    image_size_y: 1080
+    iso: 100.0
+    gamma: 2.2
+    sensor_tick: 0.1
+    stream:
+      mount: /stream/cam_front_left
+      label: gst-front-left
+
+  - comment: "Install on the top of cabin"
+    label: Car_001
+    enable: true
+    sensor_type: sensor.camera.rgb
+    role_name: car_001_camera_rgb_top
+    id: 2
+    location:
+      x: 1.0
+      y: -0.68
+      z: 4.85
+    rotation:
+      pitch: -45.0
+      yaw: -90.0
+      roll: 0.0
+    fov: 120.0
+    fstop: 1.4
+    image_size_x: 1920
+    image_size_y: 1080
+    iso: 100.0
+    gamma: 2.2
+    sensor_tick: 0.1
+    stream:
+      mount: /stream/cam_top
+      label: gst-top

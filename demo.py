@@ -133,7 +133,40 @@ def run_carla_mode():
         vehicle_bp.set_attribute("color", VEHICLE_COLOR)
         vehicle_bp.set_attribute("role_name", "car")
         vehicle_transform = carla.Transform(VEHICLE_LOCATION, VEHICLE_ROTATION)
-        vehicle = world.spawn_actor(vehicle_bp, vehicle_transform)
+
+        def _spawn_vehicle():
+            """尝试生成车辆，若碰撞则先清理残留车辆再重试"""
+            try:
+                return world.spawn_actor(vehicle_bp, vehicle_transform)
+            except RuntimeError as e:
+                if "collision at spawn position" not in str(e):
+                    raise
+                print(f"[demo] 生成车辆碰撞，尝试清理残留车辆...")
+                # 查找并销毁所有 role_name="car" 的车辆
+                cleaned = 0
+                for actor in world.get_actors():
+                    if "vehicle" in actor.type_id and getattr(actor.attributes, "get", lambda k, v=None: None)("role_name") == "car":
+                        try:
+                            actor.destroy()
+                            cleaned += 1
+                            print(f"[demo] 已清理残留车辆: id={actor.id}, type={actor.type_id}")
+                        except Exception as ex:
+                            print(f"[demo] 清理车辆失败 id={actor.id}: {ex}")
+                if cleaned == 0:
+                    print(f"[demo] 未找到 role_name='car' 的残留车辆，尝试清理所有车辆...")
+                    for actor in world.get_actors():
+                        if "vehicle" in actor.type_id:
+                            try:
+                                actor.destroy()
+                                cleaned += 1
+                                print(f"[demo] 已清理车辆: id={actor.id}, type={actor.type_id}")
+                            except Exception as ex:
+                                print(f"[demo] 清理车辆失败 id={actor.id}: {ex}")
+                # 清理后重试
+                world.tick()  # 让销毁生效
+                return world.spawn_actor(vehicle_bp, vehicle_transform)
+
+        vehicle = _spawn_vehicle()
         print(f"[demo] 创建车辆: {VEHICLE_MODEL}, pos=({VEHICLE_LOCATION.x}, {VEHICLE_LOCATION.y}, {VEHICLE_LOCATION.z}), yaw={VEHICLE_ROTATION.yaw}")
 
         # ---- 创建相机列表 ----
@@ -342,7 +375,7 @@ def run_carla_mode():
             time.sleep(frame_interval * 0.5)  # 留一些时间给键盘检测
             sleep_ms = (time.perf_counter() - sleep_t0) * 1000.0
 
-            print(f"[推流耗时] 已推帧={frame_count} " + " | ".join(stream_stats), flush=True)
+            # print(f"[推流耗时] 已推帧={frame_count} " + " | ".join(stream_stats), flush=True)
 
     except KeyboardInterrupt:
         print("\n[demo] 用户中断")
