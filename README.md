@@ -188,10 +188,17 @@ NAL 头:    4E 01     (H.265 PREFIX_SEI, type=39)
           / 06         (H.264 SEI, type=6)
 payloadType: C8        (200, 自定义)
 payloadSize: 09
-payload:    3B + 8 字节 big-endian uint64 UTC 微秒时间戳
+payload:    3B + 8 字节 big-endian uint64 UTC 纳秒时间戳
 ```
 
 发送端会在 parser 的 src pad 后注入 SEI。若使用 `vcodec="auto"`，代码会保存实际选择的编码器，避免 H.265 流误注入 H.264 SEI header。
+
+时间戳来源由 sei_use_local_time 决定：
+
+- 	rue（默认）：推流端本机系统时间（UTC 纳秒），可与接收端墙钟直接相减算端到端延迟。
+- alse：CARLA 仿真时间（carla_image.timestamp 转纳秒），用于仿真时间对齐，不能与墙钟相减。
+
+两种情况下 payload 都是纳秒，解析方式相同。
 
 ## Windows 日志说明
 
@@ -262,11 +269,10 @@ void parseSei(GstBuffer* buffer)
 
         if (di < 9 || cleanPayload[0] != ';') break;
 
-        // 8 字节 big-endian uint64 UTC us → ns
-        uint64_t utcUs = 0;
+        // 8 字节 big-endian uint64 UTC ns
+        uint64_t utcNs = 0;
         for (int j = 0; j < 8; ++j)
-            utcUs = (utcUs << 8) | cleanPayload[1 + j];
-        uint64_t utcNs = utcUs * 1000;
+            utcNs = (utcNs << 8) | cleanPayload[1 + j];
 
         // 按 PTS 存储
         uint64_t pts = GST_BUFFER_PTS(buffer);

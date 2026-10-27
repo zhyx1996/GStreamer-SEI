@@ -186,10 +186,17 @@ NAL header:    4E 01     (H.265 PREFIX_SEI, type=39)
               / 06         (H.264 SEI, type=6)
 payloadType:   C8         (200, custom)
 payloadSize:   09
-payload:       3B + 8 bytes big-endian uint64 UTC microsecond timestamp
+payload:       3B + 8 bytes big-endian uint64 UTC nanosecond timestamp
 ```
 
 The sender injects SEI after the parser's src pad. If `vcodec="auto"` is used, the code saves the actual selected encoder to avoid accidentally injecting an H.264 SEI header into an H.265 stream.
+
+The timestamp source is controlled by sei_use_local_time:
+
+- 	rue (default): sender local system time (UTC nanoseconds). Can be subtracted from the receiver wall clock to get end-to-end latency.
+- alse: CARLA simulation time (carla_image.timestamp converted to nanoseconds). Intended for simulation-time alignment; do not subtract from wall clock.
+
+The payload is always nanoseconds in both cases, so parsing is identical.
 
 ## Windows Log Notes
 
@@ -260,11 +267,10 @@ void parseSei(GstBuffer* buffer)
 
         if (di < 9 || cleanPayload[0] != ';') break;
 
-        // 8 bytes big-endian uint64 UTC us -> ns
-        uint64_t utcUs = 0;
+        // 8 bytes big-endian uint64 UTC ns
+        uint64_t utcNs = 0;
         for (int j = 0; j < 8; ++j)
-            utcUs = (utcUs << 8) | cleanPayload[1 + j];
-        uint64_t utcNs = utcUs * 1000;
+            utcNs = (utcNs << 8) | cleanPayload[1 + j];
 
         // Store by PTS
         uint64_t pts = GST_BUFFER_PTS(buffer);
