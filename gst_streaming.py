@@ -110,6 +110,7 @@ class GStreamerConfig:
 
         # ── 杂项 ──
         self.label: str = "gst-carla"            # 日志标签, 区分多实例
+        self.sei_use_local_time: bool = True    # True=SEI 用本地系统时间; False=用 Carla 仿真时间戳
 
 
 # ==============================================================================
@@ -308,7 +309,10 @@ class GStreamerObject:
         self._rtsp_server_key = None
         self._rtsp_mount_path: str = ""
         self._actual_vcodec: str = gst_cfg.vcodec # auto 解析后的实际编码器, 供 SEI NAL 类型判断
-        self._sei_ts_queue: collections.deque = collections.deque(maxlen=5)  # FIFO, zerolatency保证1:1
+
+        # FIFO 时间戳队列: send_carla_frame 入队, parser.src probe 出队, 按位置配对。
+        # HACK: maxlen 溢出时会导致此后队列偏移
+        self._sei_ts_queue: collections.deque = collections.deque(maxlen=5)
         self._sei_lock = threading.Lock()         # 保护 _sei_ts_queue 的跨线程读写
 
     # ==========================================================================
@@ -357,6 +361,7 @@ class GStreamerObject:
         br = int(self._parse_bitrate(self._gst_cfg.video_bitrate))  # kbps
         gop = self._gst_cfg.input_fps  # GOP（两个 I 帧之间的帧数） = 帧率, 即每秒一个 I 帧
 
+        # zerolatency=true + bframes=0 保证SEI队列 push-buffer 与 AU 输出 1:1 且不乱序
         encoder_map = {
             # 软件 H.264 — key-int-max=GOP 长度, zerolatency 调优 (默认 VBR)
             "x264enc":   f"x264enc tune=zerolatency speed-preset=ultrafast bitrate={br} key-int-max={gop} bframes=0",
@@ -482,7 +487,7 @@ class GStreamerObject:
             if not self._appsrc:
                 raise RuntimeError("appsrc 'mysrc' not found")
 
-            self._attach_sei_probe(self._pipeline)
+            self._attach_sei_probe(self._pipeline, self._appsrc)
 
             # 监听 bus (异步, GLib 线程触发)
             bus = self._pipeline.get_bus()
@@ -519,14 +524,21 @@ class GStreamerObject:
         )
         self._loop_thread.start()
 
-    def _attach_sei_probe(self, element):
-        """给指定 pipeline/bin 里的 parser src pad 挂 SEI 注入 probe。"""
+    def _attach_sei_probe(self, element, owner):
+        """
+        给指定 pipeline/bin 里的 parser src pad 挂 SEI 注入 probe。
+
+        Args:
+            element: 本次会话的 pipeline/bin (media.get_element() 的返回值)。
+            owner:   本次会话的 appsrc 对象, 作为会话身份凭证，由调用方显式传入。
+        """
         parser = element.get_by_name("parser") if element else None
         if not parser:
             return
         src_pad = parser.get_static_pad("src")
         if src_pad:
-            src_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_encoder_output, None)
+            src_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_encoder_output,
+                              owner)
             print(f"[{self._gst_cfg.label}] SEI probe attached to parser src pad")
 
     def _initialize_rtsp_server(self) -> bool:
@@ -538,6 +550,7 @@ class GStreamerObject:
 
             self._rtsp_factory = GstRtspServer.RTSPMediaFactory.new()
             self._rtsp_factory.set_launch(launch)
+            # 允许多客户端共享同一路流
             self._rtsp_factory.set_shared(True)
             self._rtsp_factory.connect("media-configure", self._on_rtsp_media_configure)
 
@@ -558,21 +571,51 @@ class GStreamerObject:
             return False
 
     def _on_rtsp_media_configure(self, factory, media):
-        """客户端首次连接时 gst-rtsp-server 创建 media pipeline，在这里拿 appsrc。"""
+        """客户端首次连接时 gst-rtsp-server 创建 media pipeline，在这里拿 appsrc。
+        """
+
+        # 关闭 media 复用（默认如此），重连后新建appsrc
+        try:
+            media.set_reusable(False)
+        except Exception as e:
+            print(f"[WARN] {self._gst_cfg.label} set_reusable(False) failed: {e}")
+
         element = media.get_element()
-        self._pipeline = element
-        self._appsrc = element.get_by_name("mysrc")
-        if not self._appsrc:
+        appsrc = element.get_by_name("mysrc") if element is not None else None
+        if not appsrc:
             print(f"[ERROR] {self._gst_cfg.label} RTSP server appsrc 'mysrc' not found")
             return
-        self._attach_sei_probe(element)
-        media.connect("unprepared", self._on_rtsp_media_unprepared)
+
+        # 设置断开回调和SEI探针, 同时传入本次会话的 appsrc
+        media.connect("unprepared", self._on_rtsp_media_unprepared, appsrc)
+        self._attach_sei_probe(element, appsrc)
+
+        with self._sei_lock:
+            qleft = len(self._sei_ts_queue)
+            # 清掉上一会话残留的 SEI 时间戳队列，否则会导致SEI错位
+            self._sei_ts_queue.clear()
+            self._pipeline = element
+            self._appsrc = appsrc
+            print(f"[{self._gst_cfg.label}] RTSP media-configure "
+                  f"sei_queue_left={qleft} (残留已丢弃)")
+
         print(f"[{self._gst_cfg.label}] RTSP client connected, appsrc ready")
 
-    def _on_rtsp_media_unprepared(self, media):
-        """共享 media 释放后清掉 appsrc，避免继续 push 到失效对象。"""
-        self._appsrc = None
-        self._pipeline = None
+    def _on_rtsp_media_unprepared(self, media, owner):
+        """客户端断开连接时的回调函数"""
+        with self._sei_lock:
+            # 校验断开的是否为本轮会话，防止断开后马上重连，误将新会话停止
+            if self._appsrc is not owner:
+                print(f"[{self._gst_cfg.label}] RTSP media-unprepared ignored "
+                      f"(stale session)")
+                return
+
+            # 共享 media 释放后清理引用，避免推帧到失效对象
+            self._appsrc = None
+            self._pipeline = None
+            # 顺便清理一下SEI队列，防止新会话误用旧会话的时间戳
+            self._sei_ts_queue.clear()
+
         print(f"[{self._gst_cfg.label}] RTSP media unprepared, appsrc cleared")
 
     # ==========================================================================
@@ -610,20 +653,29 @@ class GStreamerObject:
 			timestamp  (double)  仿真时间戳 (秒, 用于 SEI 注入)
 			frame      (int)     帧序号
         """
-        if not self._ready or self._appsrc is None:
+
+        appsrc = self._appsrc
+        if not self._ready or appsrc is None:
             return
         try:
             raw_data = carla_image.raw_data
             frame_data = raw_data.tobytes() if isinstance(raw_data, memoryview) else bytes(raw_data)
             buf = Gst.Buffer.new_wrapped(frame_data)
 
-            # FIFO 入队时间戳 (微秒), probe 按帧顺序出队
-            ts_us = int(carla_image.timestamp * 1_000_000)
+            # FIFO 入队时间戳 (纳秒), probe 按帧顺序出队
+            if self._gst_cfg.sei_use_local_time:
+                ts_ns = int(time.time() * 1_000_000_000)
+            else:
+                ts_ns = int(carla_image.timestamp * 1_000_000_000)
             with self._sei_lock:
-                self._sei_ts_queue.append(ts_us)
+                # 防止拷贝期间切换会话
+                if self._appsrc is not appsrc:
+                    return
+                self._sei_ts_queue.append(ts_ns)
 
-            ret = self._appsrc.emit("push-buffer", buf)
+            ret = appsrc.emit("push-buffer", buf)
             if ret != Gst.FlowReturn.OK:
+                # HACK: 失败时应从_sei_ts_queue中移除对应的时间戳
                 print(f"[WARN] {self._gst_cfg.label} push-buffer: {ret}")
         except Exception as e:
             print(f"[ERROR] {self._gst_cfg.label} send_carla_frame: {e}")
@@ -632,12 +684,10 @@ class GStreamerObject:
     #  内部: SEI 注入 & Bus 消息处理 & 资源清理
     # ==========================================================================
 
-    def _inject_sei(self, buffer: Gst.Buffer) -> Gst.Buffer:
+    def _inject_sei(self, buffer: Gst.Buffer, ts_ns: int) -> Gst.Buffer:
         """
         在编码后的 buffer 前插入 SEI NAL (H.264/H.265)。
-        
-        FIFO 队列出队取时间戳: zerolatency+bframes=0 保证 push-buffer 与 probe 1:1 对应。
-        
+
         SEI 格式 (匹配接收端 parseSei 解析):
             start code: 00 00 00 01
             NAL header:
@@ -645,12 +695,9 @@ class GStreamerObject:
                 H.264: 06    (SEI, type=6, 1字节)
             payloadType: C8 (200, 自定义)
             payloadSize: 09
-            payload: 3B (';') + 8字节 big-endian uint64 UTC 微秒时间戳
+            payload: 3B (';') + 8字节 big-endian uint64 UTC 纳秒时间戳
         """
-        # FIFO 出队: zerolatency+bframes=0 保证 push-buffer 与 probe 1:1
-        with self._sei_lock:
-            ts_us = self._sei_ts_queue.popleft() if self._sei_ts_queue else 0
-        # print(f"[{self._gst_cfg.label}] probe SEI us={ts_us}  PTS={buffer.pts} ns  queue_left={len(self._sei_ts_queue)}")
+        # print(f"[{self._gst_cfg.label}] probe SEI ns={ts_ns}  PTS={buffer.pts} ns  queue_left={len(self._sei_ts_queue)}")
 
         vcodec = self._actual_vcodec or self._gst_cfg.vcodec
         is_h265 = self._is_h265(vcodec)
@@ -660,14 +707,14 @@ class GStreamerObject:
         # payload = 0x3B prefix + 8字节 big-endian uint64 时间戳
         sei_payload = bytearray([
             0x3B,                    # ';' prefix
-            (ts_us >> 56) & 0xFF,    # 8字节 big-endian uint64
-            (ts_us >> 48) & 0xFF,
-            (ts_us >> 40) & 0xFF,
-            (ts_us >> 32) & 0xFF,
-            (ts_us >> 24) & 0xFF,
-            (ts_us >> 16) & 0xFF,
-            (ts_us >> 8) & 0xFF,
-            ts_us & 0xFF,
+            (ts_ns >> 56) & 0xFF,    # 8字节 big-endian uint64
+            (ts_ns >> 48) & 0xFF,
+            (ts_ns >> 40) & 0xFF,
+            (ts_ns >> 32) & 0xFF,
+            (ts_ns >> 24) & 0xFF,
+            (ts_ns >> 16) & 0xFF,
+            (ts_ns >> 8) & 0xFF,
+            ts_ns & 0xFF,
         ])
 
         # emulation prevention: 防止 payload 中出现起始码
@@ -717,7 +764,7 @@ class GStreamerObject:
 
         return merged
 
-    def _on_encoder_output(self, pad: Gst.Pad, info: Gst.PadProbeInfo, udata) -> Gst.PadProbeReturn:
+    def _on_encoder_output(self, pad: Gst.Pad, info: Gst.PadProbeInfo, owner) -> Gst.PadProbeReturn:
         """
         encoder 输出 probe 回调, 在编码后的 buffer 前注入 SEI。
 
@@ -727,7 +774,20 @@ class GStreamerObject:
         # t0 = time.perf_counter()
 
         buffer = info.get_buffer()
-        new_buf = self._inject_sei(buffer)
+        if buffer is None:
+            return Gst.PadProbeReturn.OK
+
+        with self._sei_lock:
+            # 检查当前会话是否与初始化时一致, 防止重连后旧会话残留的回调导致时间戳错位
+            if self._appsrc is not owner:
+                return Gst.PadProbeReturn.DROP
+            if not self._sei_ts_queue:
+                # 无可信时间戳则丢弃此帧
+                print(f"[WARN] {self._gst_cfg.label} SEI 队列空, 丢弃该AU，可能存在SEI错位")
+                return Gst.PadProbeReturn.DROP
+            ts_ns = self._sei_ts_queue.popleft()
+
+        new_buf = self._inject_sei(buffer, ts_ns)
         info.set_buffer(new_buf)
 
         # dt_us = (time.perf_counter() - t0) * 1_000_000
