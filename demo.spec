@@ -37,6 +37,18 @@ for package in [
     binaries += package_binaries
     hiddenimports += package_hiddenimports
 
+# giolibproxy.dll 在本环境始终加载失败(依赖 proxy-1.dll 不在模块同目录, 加载不搜索 PATH),
+# 排除以免冷启动扫描插件时打印 "Failed to load module"。
+import os
+
+
+def _is_giolibproxy(_entry):
+    return os.path.basename(_entry[0]).lower() == "giolibproxy.dll"
+
+
+datas = [d for d in datas if not _is_giolibproxy(d)]
+binaries = [b for b in binaries if not _is_giolibproxy(b)]
+
 a = Analysis(
     ["demo.py"],
     pathex=[],
